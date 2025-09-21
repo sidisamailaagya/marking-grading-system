@@ -1,0 +1,407 @@
+<?php
+declare(strict_types=1);
+
+// Always return JSON (avoid any accidental HTML)
+header('Content-Type: application/json');
+
+require_once __DIR__ . '/../config/db.php';
+
+// Helper to send JSON responses and exit
+function respond(int $status, $data = null): void {
+    http_response_code($status);
+    if ($data !== null) {
+        echo json_encode($data);
+    }
+    exit;
+}
+
+// Parse JSON request body
+function json_input(): array {
+    $raw = file_get_contents('php://input') ?: '';
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : [];
+}
+
+// Enum validators
+function validate_semester(string $s): string {
+    $allowed = ['First', 'Second', 'Summer'];
+    return in_array($s, $allowed, true) ? $s : 'First';
+}
+function validate_status(string $s): string {
+    $allowed = ['active', 'inactive'];
+    return in_array($s, $allowed, true) ? $s : 'active';
+}
+
+// Lookup or create faculty/department by name
+function find_or_create_faculty(mysqli $db, string $faculty_name): int {
+    $faculty_name = trim($faculty_name);
+    if ($faculty_name === '') throw new InvalidArgumentException('faculty_name required');
+
+    $stmt = $db->prepare("SELECT faculty_id FROM faculties WHERE faculty_name = ?");
+    $stmt->bind_param('s', $faculty_name);
+    $stmt->execute();
+    $stmt->bind_result($fid);
+    if ($stmt->fetch()) {
+        $stmt->close();
+        return (int)$fid;
+    }
+    $stmt->close();
+
+    $stmt = $db->prepare("INSERT INTO faculties (faculty_name) VALUES (?)");
+    $stmt->bind_param('s', $faculty_name);
+    $stmt->execute();
+    $newId = (int)$stmt->insert_id;
+    $stmt->close();
+    return $newId;
+}
+
+function find_or_create_department(mysqli $db, string $dept_name, int $faculty_id): int {
+    $dept_name = trim($dept_name);
+    if ($dept_name === '') throw new InvalidArgumentException('dept_name required');
+
+    $stmt = $db->prepare("SELECT dept_id FROM departments WHERE dept_name = ? AND faculty_id = ?");
+    $stmt->bind_param('si', $dept_name, $faculty_id);
+    $stmt->execute();
+    $stmt->bind_result($did);
+    if ($stmt->fetch()) {
+        $stmt->close();
+        return (int)$did;
+    }
+    $stmt->close();
+
+    $stmt = $db->prepare("INSERT INTO departments (dept_name, faculty_id) VALUES (?, ?)");
+    $stmt->bind_param('si', $dept_name, $faculty_id);
+    $stmt->execute();
+    $newId = (int)$stmt->insert_id;
+    $stmt->close();
+    return $newId;
+}
+
+// Levels helpers (requires table course_levels(course_id, level_value))
+function get_levels(mysqli $db, int $course_id): array {
+    $levels = [];
+    if (!$db) return $levels;
+    $stmt = $db->prepare("SELECT level_value FROM course_levels WHERE course_id = ? ORDER BY level_value ASC");
+    if (!$stmt) return $levels;
+    $stmt->bind_param('i', $course_id);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    while ($row = $res->fetch_assoc()) $levels[] = (int)$row['level_value'];
+    $stmt->close();
+    return $levels;
+}
+
+function set_levels(mysqli $db, int $course_id, array $levels): void {
+    // Replace levels atomically
+    $stmt = $db->prepare("DELETE FROM course_levels WHERE course_id = ?");
+    $stmt->bind_param('i', $course_id);
+    $stmt->execute();
+    $stmt->close();
+
+    if (!$levels) return;
+
+    $stmt = $db->prepare("INSERT INTO course_levels (course_id, level_value) VALUES (?, ?)");
+    foreach ($levels as $lvl) {
+        $lvl = (int)$lvl;
+        if ($lvl <= 0) continue;
+        $stmt->bind_param('ii', $course_id, $lvl);
+        $stmt->execute();
+    }
+    $stmt->close();
+}
+
+// Routes
+function list_courses(mysqli $db): void {
+    $q      = isset($_GET['search']) ? trim((string)$_GET['search']) : '';
+    $deptId = isset($_GET['dept_id']) && $_GET['dept_id'] !== '' ? (int)$_GET['dept_id'] : null;
+    $status = isset($_GET['status']) ? (string)$_GET['status'] : '';
+
+    $params = [];
+    $types  = '';
+    $where  = [];
+
+    if ($q !== '') {
+        $like = '%' . $q . '%';
+        $where[] = '(c.course_code LIKE ? OR c.course_name LIKE ?)';
+        $params[] = $like; $params[] = $like;
+        $types .= 'ss';
+    }
+    if ($deptId !== null) {
+        $where[] = 'c.dept_id = ?';
+        $params[] = $deptId;
+        $types .= 'i';
+    }
+    if ($status !== '') {
+        $where[] = 'c.status = ?';
+        $params[] = validate_status($status);
+        $types .= 's';
+    }
+
+    $sql = "SELECT
+                c.course_id, c.course_code, c.course_name, c.credit_unit,
+                c.semester, c.status, c.created_at,
+                f.faculty_name, d.dept_name
+            FROM courses c
+            LEFT JOIN faculties f ON f.faculty_id = c.faculty_id
+            LEFT JOIN departments d ON d.dept_id = c.dept_id";
+    if ($where) $sql .= ' WHERE ' . implode(' AND ', $where);
+    $sql .= ' ORDER BY c.created_at DESC, c.course_name ASC LIMIT 500';
+
+    $stmt = $db->prepare($sql);
+    if ($params) $stmt->bind_param($types, ...$params);
+    $stmt->execute();
+    $res = $stmt->get_result();
+
+    $courses = [];
+    while ($row = $res->fetch_assoc()) {
+        $id = (int)$row['course_id'];
+        $courses[] = [
+            'course_id'    => $id,
+            'course_code'  => $row['course_code'],
+            'course_name'  => $row['course_name'],
+            'credit_unit'  => (float)$row['credit_unit'],
+            'semester'     => $row['semester'],
+            'status'       => $row['status'],
+            'faculty_name' => $row['faculty_name'] ?: '',
+            'dept_name'    => $row['dept_name'] ?: '',
+            'levels'       => get_levels($db, $id),
+            'created_at'   => $row['created_at'],
+        ];
+    }
+    $stmt->close();
+    respond(200, ['data' => $courses]);
+}
+
+function create_course(mysqli $db): void {
+    $in = json_input();
+
+    $course_code = trim((string)($in['course_code'] ?? ''));
+    $course_name = trim((string)($in['course_name'] ?? ''));
+    $credit_unit = (float)($in['credit_unit'] ?? 0);
+    $semester    = validate_semester((string)($in['semester'] ?? 'First'));
+    $status      = validate_status((string)($in['status'] ?? 'active'));
+    $faculty     = trim((string)($in['faculty_name'] ?? ''));
+    $department  = trim((string)($in['dept_name'] ?? ''));
+    $levels      = is_array($in['levels'] ?? null) ? array_values($in['levels']) : [];
+
+    if ($course_code === '' || $course_name === '' || $credit_unit <= 0 || $faculty === '' || $department === '' || count($levels) === 0) {
+        respond(422, ['error' => 'Missing or invalid fields. Require course_code, course_name, credit_unit>0, faculty_name, dept_name, levels[].']);
+    }
+
+    $db->begin_transaction();
+    try {
+        $faculty_id = find_or_create_faculty($db, $faculty);
+        $dept_id    = find_or_create_department($db, $department, $faculty_id);
+
+        // Prevent duplicate code
+        $stmt = $db->prepare("SELECT COUNT(*) FROM courses WHERE LOWER(course_code) = LOWER(?)");
+        $stmt->bind_param('s', $course_code);
+        $stmt->execute();
+        $stmt->bind_result($cnt);
+        $stmt->fetch();
+        $stmt->close();
+        if ($cnt > 0) {
+            $db->rollback();
+            respond(409, ['error' => 'A course with this code already exists.']);
+        }
+
+        $stmt = $db->prepare("INSERT INTO courses (course_code, course_name, credit_unit, faculty_id, dept_id, semester, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())");
+        $stmt->bind_param('ssdisss', $course_code, $course_name, $credit_unit, $faculty_id, $dept_id, $semester, $status);
+        $stmt->execute();
+        $course_id = (int)$stmt->insert_id;
+        $stmt->close();
+
+        set_levels($db, $course_id, $levels);
+
+        $db->commit();
+        respond(201, ['message' => 'Course created', 'course_id' => $course_id]);
+    } catch (Throwable $e) {
+        $db->rollback();
+        respond(500, ['error' => 'Failed to create course', 'detail' => $e->getMessage()]);
+    }
+}
+
+function update_course(mysqli $db, int $course_id): void {
+    $in = json_input();
+    $course_code = trim((string)($in['course_code'] ?? ''));
+    $course_name = trim((string)($in['course_name'] ?? ''));
+    $credit_unit = (float)($in['credit_unit'] ?? 0);
+    $semester    = validate_semester((string)($in['semester'] ?? 'First'));
+    $status      = validate_status((string)($in['status'] ?? 'active'));
+    $faculty     = trim((string)($in['faculty_name'] ?? ''));
+    $department  = trim((string)($in['dept_name'] ?? ''));
+    $levels      = is_array($in['levels'] ?? null) ? array_values($in['levels']) : [];
+
+    if ($course_code === '' || $course_name === '' || $credit_unit <= 0 || $faculty === '' || $department === '' || count($levels) === 0) {
+        respond(422, ['error' => 'Missing or invalid fields.']);
+    }
+
+    $db->begin_transaction();
+    try {
+        $faculty_id = find_or_create_faculty($db, $faculty);
+        $dept_id    = find_or_create_department($db, $department, $faculty_id);
+
+        // Prevent changing to duplicate code (other row)
+        $stmt = $db->prepare("SELECT COUNT(*) FROM courses WHERE LOWER(course_code) = LOWER(?) AND course_id <> ?");
+        $stmt->bind_param('si', $course_code, $course_id);
+        $stmt->execute();
+        $stmt->bind_result($cnt);
+        $stmt->fetch();
+        $stmt->close();
+        if ($cnt > 0) {
+            $db->rollback();
+            respond(409, ['error' => 'A course with this code already exists.']);
+        }
+
+        $stmt = $db->prepare("UPDATE courses SET course_code=?, course_name=?, credit_unit=?, faculty_id=?, dept_id=?, semester=?, status=? WHERE course_id=?");
+        $stmt->bind_param('ssdisssi', $course_code, $course_name, $credit_unit, $faculty_id, $dept_id, $semester, $status, $course_id);
+        $stmt->execute();
+        $stmt->close();
+
+        set_levels($db, $course_id, $levels);
+
+        $db->commit();
+        respond(200, ['message' => 'Course updated']);
+    } catch (Throwable $e) {
+        $db->rollback();
+        respond(500, ['error' => 'Failed to update course', 'detail' => $e->getMessage()]);
+    }
+}
+
+function delete_course(mysqli $db, int $course_id): void {
+    $stmt = $db->prepare("DELETE FROM courses WHERE course_id = ?");
+    $stmt->bind_param('i', $course_id);
+    $stmt->execute();
+    $affected = $stmt->affected_rows;
+    $stmt->close();
+    respond($affected > 0 ? 200 : 404, ['message' => $affected > 0 ? 'Course deleted' : 'Not found']);
+}
+
+function options(mysqli $db): void {
+    $faculties = [];
+    $departments = [];
+
+    $res = $db->query("SELECT faculty_id, faculty_name FROM faculties ORDER BY faculty_name ASC");
+    while ($row = $res->fetch_assoc()) {
+        $faculties[] = ['faculty_id' => (int)$row['faculty_id'], 'faculty_name' => $row['faculty_name']];
+    }
+    $res->free();
+
+    $res = $db->query("SELECT dept_id, faculty_id, dept_name FROM departments ORDER BY dept_name ASC");
+    while ($row = $res->fetch_assoc()) {
+        $departments[] = [
+            'dept_id'     => (int)$row['dept_id'],
+            'faculty_id'  => (int)$row['faculty_id'],
+            'dept_name'   => $row['dept_name']
+        ];
+    }
+    $res->free();
+
+    respond(200, ['faculties' => $faculties, 'departments' => $departments]);
+}
+
+function import_csv(mysqli $db): void {
+    if (!isset($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) {
+        respond(400, ['error' => 'No file uploaded or upload error']);
+    }
+    $tmp = $_FILES['file']['tmp_name'];
+    $fh = fopen($tmp, 'r');
+    if (!$fh) respond(400, ['error' => 'Failed to read uploaded file']);
+
+    // Expected headers (case-insensitive):
+    // Code, Title, Faculty, Department, Levels (comma-separated), Units, Semester, Status
+    $header = fgetcsv($fh);
+    if (!$header) respond(400, ['error' => 'Empty CSV']);
+    $map = [];
+    foreach ($header as $i => $h) {
+        $h = strtolower(trim($h));
+        $map[$h] = $i;
+    }
+    $required = ['code','title','faculty','department','levels','units','semester','status'];
+    foreach ($required as $col) if (!array_key_exists($col, $map)) respond(400, ['error' => "Missing column: $col"]);
+
+    $inserted = 0; $updated = 0; $errors = 0; $lineNo = 1;
+    $db->begin_transaction();
+    try {
+        while (($row = fgetcsv($fh)) !== false) {
+            $lineNo++;
+            $code   = trim((string)($row[$map['code']] ?? ''));
+            $title  = trim((string)($row[$map['title']] ?? ''));
+            $fac    = trim((string)($row[$map['faculty']] ?? ''));
+            $dept   = trim((string)($row[$map['department']] ?? ''));
+            $levels = array_values(array_filter(array_map('trim', explode(',', (string)($row[$map['levels']] ?? ''))), fn($x)=>$x!==''));
+            $units  = (float)($row[$map['units']] ?? 0);
+            $sem    = validate_semester((string)($row[$map['semester']] ?? 'First'));
+            $stat   = validate_status((string)($row[$map['status']] ?? 'active'));
+
+            if ($code==='' || $title==='' || $fac==='' || $dept==='' || $units<=0 || empty($levels)) { $errors++; continue; }
+            $levelsInt = array_map(fn($x) => (int)$x, $levels);
+
+            $faculty_id = find_or_create_faculty($db, $fac);
+            $dept_id    = find_or_create_department($db, $dept, $faculty_id);
+
+            // Upsert by course_code
+            $stmt = $db->prepare("SELECT course_id FROM courses WHERE LOWER(course_code) = LOWER(?)");
+            $stmt->bind_param('s', $code);
+            $stmt->execute();
+            $stmt->bind_result($cid);
+            if ($stmt->fetch()) {
+                $stmt->close();
+                $cid = (int)$cid;
+                $stmt2 = $db->prepare("UPDATE courses SET course_name=?, credit_unit=?, faculty_id=?, dept_id=?, semester=?, status=? WHERE course_id=?");
+                $stmt2->bind_param('sdisssi', $title, $units, $faculty_id, $dept_id, $sem, $stat, $cid);
+                $stmt2->execute();
+                $stmt2->close();
+                set_levels($db, $cid, $levelsInt);
+                $updated++;
+            } else {
+                $stmt->close();
+                $stmt2 = $db->prepare("INSERT INTO courses (course_code, course_name, credit_unit, faculty_id, dept_id, semester, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())");
+                $stmt2->bind_param('ssdisss', $code, $title, $units, $faculty_id, $dept_id, $sem, $stat);
+                $stmt2->execute();
+                $cid = (int)$stmt2->insert_id;
+                $stmt2->close();
+                set_levels($db, $cid, $levelsInt);
+                $inserted++;
+            }
+        }
+        fclose($fh);
+        $db->commit();
+        respond(200, ['message' => 'Import complete', 'inserted' => $inserted, 'updated' => $updated, 'errors' => $errors]);
+    } catch (Throwable $e) {
+        if (is_resource($fh)) fclose($fh);
+        $db->rollback();
+        respond(500, ['error' => 'Import failed', 'detail' => $e->getMessage()]);
+    }
+}
+
+// Connect DB
+try {
+    $db = get_mysqli();
+} catch (Throwable $e) {
+    respond(500, ['error' => 'DB connection failed', 'detail' => $e->getMessage()]);
+}
+
+// Method + action routing (supports POST override via ?_method=PUT/DELETE)
+$method = $_SERVER['REQUEST_METHOD'];
+if ($method === 'POST' && isset($_GET['_method'])) {
+    $method = strtoupper((string)$_GET['_method']);
+}
+$action = isset($_GET['action']) ? (string)$_GET['action'] : '';
+
+if ($method === 'GET' && $action === 'options') options($db);
+if ($method === 'GET') list_courses($db);
+if ($method === 'POST' && $action === 'import') import_csv($db);
+if ($method === 'POST') create_course($db);
+if ($method === 'PUT') {
+    $id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+    if ($id <= 0) respond(400, ['error' => 'id required']);
+    update_course($db, $id);
+}
+if ($method === 'DELETE') {
+    $id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+    if ($id <= 0) respond(400, ['error' => 'id required']);
+    delete_course($db, $id);
+}
+
+respond(405, ['error' => 'Method Not Allowed']);
