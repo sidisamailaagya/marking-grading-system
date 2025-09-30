@@ -1,3 +1,253 @@
+<?php
+
+declare(strict_types=1);
+session_start();
+
+// Authentication and database connection
+require_once __DIR__ . '/../includes/auth.php';
+require_once __DIR__ . '/../includes/connect.php';
+
+// Clear any login errors since we're successfully logged in
+unset($_SESSION['error']);
+
+// Check if user is logged in and is a lecturer
+if (!isset($_SESSION['uid']) || $_SESSION['role'] !== 'lecturer') {
+  header('Location: ../login.php');
+  exit;
+}
+/**
+ * Find a mysqli connection
+ */
+function db_connect_auto(): ?mysqli
+{
+  foreach (['conn', 'con', 'mysqli'] as $var) {
+    if (isset($GLOBALS[$var]) && $GLOBALS[$var] instanceof mysqli) {
+      return $GLOBALS[$var];
+    }
+  }
+  foreach (['db', 'db_connect'] as $fn) {
+    if (function_exists($fn)) {
+      $maybe = $fn();
+      if ($maybe instanceof mysqli) return $maybe;
+    }
+  }
+  return null;
+}
+
+function h(?string $s): string
+{
+  return htmlspecialchars((string)($s ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+// Get database connection
+$mysqli = db_connect_auto();
+if (!$mysqli) {
+  die('Database connection failed. Please check your configuration.');
+}
+
+// Get lecturer ID from session
+$lecturer_id = (int)$_SESSION['uid'];
+
+/**
+ * Get lecturer information
+ */
+function get_lecturer_info(mysqli $db, int $lecturer_id): ?array
+{
+  $stmt = $db->prepare("SELECT lecturer_id, lecturer_name, email, dept_id FROM lecturers WHERE lecturer_id = ?");
+  if (!$stmt) return null;
+
+  $stmt->bind_param('i', $lecturer_id);
+  $stmt->execute();
+  $result = $stmt->get_result();
+  $lecturer = $result->fetch_assoc();
+  $stmt->close();
+
+  return $lecturer;
+}
+
+/**
+ * Get lecturer's assigned courses with student counts
+ */
+function get_lecturer_courses(mysqli $db, int $lecturer_id): array
+{
+  $sql = "SELECT 
+                c.course_id,
+                c.course_code,
+                c.course_name,
+                ca.session_id,
+                ca.level_id,
+                ca.dept_id,
+                ca.session,
+                COUNT(DISTINCT s.student_id) as enrolled_count
+            FROM course_assignments ca
+            INNER JOIN courses c ON ca.course_id = c.course_id
+            LEFT JOIN students s ON ca.dept_id = s.dept_id AND ca.level_id = s.level
+            WHERE ca.lecturer_id = ?
+            GROUP BY c.course_id, ca.session_id, ca.level_id, ca.dept_id
+            ORDER BY c.course_code";
+
+  $stmt = $db->prepare($sql);
+  if (!$stmt) return [];
+
+  $stmt->bind_param('i', $lecturer_id);
+  $stmt->execute();
+  $result = $stmt->get_result();
+
+  $courses = [];
+  while ($row = $result->fetch_assoc()) {
+    $courses[] = $row;
+  }
+
+  $stmt->close();
+  return $courses;
+}
+
+/**
+ * Get lecturer statistics
+ */
+function get_lecturer_stats(mysqli $db, int $lecturer_id): array
+{
+  // Total students across all lecturer's courses (based on dept_id and level matching)
+  $stmt = $db->prepare("
+        SELECT COUNT(DISTINCT s.student_id) as total_students
+        FROM course_assignments ca
+        LEFT JOIN students s ON ca.dept_id = s.dept_id AND ca.level_id = s.level
+        WHERE ca.lecturer_id = ?
+    ");
+
+  if (!$stmt) return ['students' => 0, 'pending' => 0, 'average' => 0];
+
+  $stmt->bind_param('i', $lecturer_id);
+  $stmt->execute();
+  $result = $stmt->get_result();
+  $total_students = $result->fetch_assoc()['total_students'] ?? 0;
+  $stmt->close();
+
+  // For now, set pending grades and average to 0 since we need to clarify results table structure
+  $pending_grades = 0;
+  $avg_performance = 0;
+
+  return [
+    'students' => (int)$total_students,
+    'pending' => (int)$pending_grades,
+    'average' => round((float)$avg_performance, 1)
+  ];
+}
+
+/**
+ * Get lecturer notifications
+ */
+function get_lecturer_notifications(mysqli $db, int $lecturer_id): array
+{
+  $notifications = [];
+
+  // Info notifications - course student summary
+  $stmt = $db->prepare("
+        SELECT 
+            c.course_code,
+            COUNT(DISTINCT s.student_id) as total_students
+        FROM course_assignments ca
+        INNER JOIN courses c ON ca.course_id = c.course_id
+        LEFT JOIN students s ON ca.dept_id = s.dept_id AND ca.level_id = s.level
+        WHERE ca.lecturer_id = ?
+        GROUP BY c.course_id, c.course_code
+        HAVING total_students > 0
+        ORDER BY total_students DESC
+        LIMIT 2
+    ");
+
+  if ($stmt) {
+    $stmt->bind_param('i', $lecturer_id);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    while ($row = $result->fetch_assoc()) {
+      $notifications[] = [
+        'type' => 'info',
+        'text' => $row['course_code'] . ' has ' . $row['total_students'] . ' eligible student(s)',
+        'time' => 'Current registration'
+      ];
+    }
+    $stmt->close();
+  }
+
+  // Course assignment notifications
+  $stmt = $db->prepare("
+        SELECT 
+            c.course_code,
+            c.course_name,
+            ca.session
+        FROM course_assignments ca
+        INNER JOIN courses c ON ca.course_id = c.course_id
+        WHERE ca.lecturer_id = ?
+        ORDER BY ca.created_at DESC
+        LIMIT 3
+    ");
+
+  if ($stmt) {
+    $stmt->bind_param('i', $lecturer_id);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    while ($row = $result->fetch_assoc()) {
+      $notifications[] = [
+        'type' => 'info',
+        'text' => 'You are assigned to teach ' . $row['course_code'] . ' - ' . $row['course_name'],
+        'time' => 'Session: ' . ($row['session'] ?? 'Current')
+      ];
+    }
+    $stmt->close();
+  }
+
+  // If no notifications, add a default one
+  if (empty($notifications)) {
+    $notifications[] = [
+      'type' => 'info',
+      'text' => 'All caught up! No urgent notifications.',
+      'time' => 'Today'
+    ];
+  }
+
+  return $notifications;
+}
+
+// Fetch all data
+$lecturer = get_lecturer_info($mysqli, $lecturer_id);
+$courses = get_lecturer_courses($mysqli, $lecturer_id);
+$stats = get_lecturer_stats($mysqli, $lecturer_id);
+$notifications = get_lecturer_notifications($mysqli, $lecturer_id);
+
+// Handle case where lecturer is not found
+if (!$lecturer) {
+  session_destroy();
+  header('Location: ../login.php?error=invalid_lecturer');
+  exit;
+}
+
+// Group courses by course_code for display
+$grouped_courses = [];
+foreach ($courses as $course) {
+  $key = $course['course_code'];
+  if (!isset($grouped_courses[$key])) {
+    $grouped_courses[$key] = [
+      'course_id' => $course['course_id'],
+      'course_code' => $course['course_code'],
+      'course_name' => $course['course_name'],
+      'sessions' => [],
+      'levels' => [],
+      'total_enrolled' => 0,
+      'total_pending' => 0
+    ];
+  }
+
+  $grouped_courses[$key]['sessions'][] = $course['session'] ?? $course['session_id'];
+  $grouped_courses[$key]['levels'][] = $course['level_id'];
+  $grouped_courses[$key]['total_enrolled'] += (int)$course['enrolled_count'];
+  // Removed pending grades calculation for now
+  $grouped_courses[$key]['total_pending'] = 0;
+}
+
+?>
 <!DOCTYPE html>
 <html lang="en">
 
@@ -107,6 +357,7 @@
       border-radius: var(--radius);
       box-shadow: var(--card-shadow);
       padding: 1.25rem;
+      transition: var(--transition);
     }
 
     .card:hover {
@@ -165,6 +416,11 @@
       border-radius: 10px;
       border: 1px solid #edf2f7;
       align-items: flex-start;
+      transition: var(--transition);
+    }
+
+    .notif:hover {
+      background: #f7fafc;
     }
 
     .notif .badge {
@@ -200,6 +456,12 @@
       gap: .5rem;
       cursor: pointer;
       transition: var(--transition);
+      text-decoration: none;
+      font-size: 0.9rem;
+    }
+
+    .btn:hover {
+      transform: translateY(-2px);
     }
 
     .btn-primary {
@@ -231,6 +493,12 @@
       padding: .75rem;
       border: 1px solid #edf2f7;
       border-radius: 10px;
+      transition: var(--transition);
+    }
+
+    .course-row:hover {
+      background: #f7fafc;
+      border-color: #cbd5e0;
     }
 
     .course-meta {
@@ -241,6 +509,26 @@
       font-size: .88rem;
     }
 
+    .no-data {
+      text-align: center;
+      color: #718096;
+      padding: 2rem;
+      font-style: italic;
+    }
+
+    .alert {
+      padding: 1rem;
+      border-radius: 10px;
+      margin-bottom: 1rem;
+      border: 1px solid;
+    }
+
+    .alert-info {
+      background: #ebf8ff;
+      color: #2b6cb0;
+      border-color: #bee3f8;
+    }
+
     @media (max-width: 1100px) {
       .grid {
         grid-template-columns: 1fr;
@@ -248,6 +536,17 @@
 
       .grid-3 {
         grid-template-columns: 1fr;
+      }
+
+      .course-row {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.75rem;
+      }
+
+      .actions {
+        width: 100%;
+        justify-content: flex-end;
       }
     }
   </style>
@@ -265,7 +564,6 @@
           <li class="nav-item"><a href="enter-grades.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-pen-to-square"></i></span><span class="pcoded-mtext">Enter Grades</span></a></li>
           <li class="nav-item"><a href="student-performance.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-user-chart"></i></span><span class="pcoded-mtext">View Student Performance</span></a></li>
           <li class="nav-item"><a href="reports-analytics.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-chart-simple"></i></span><span class="pcoded-mtext">Reports & Analytics</span></a></li>
-          <li class="nav-item"><a href="feedback-remarks.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-comments"></i></span><span class="pcoded-mtext">Feedback & Remarks</span></a></li>
           <li class="nav-item"><a href="profile-settings.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-user-cog"></i></span><span class="pcoded-mtext">Profile Settings</span></a></li>
           <li class="nav-item"><a href="../logout.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-sign-out-alt"></i></span><span class="pcoded-mtext">Logout</span></a></li>
         </ul>
@@ -278,7 +576,7 @@
     <div class="m-header">
       <a class="mobile-menu" id="mobile-collapse" href="#"><span></span></a>
       <a href="#" class="b-brand">
-        <h3 class="text-primary mb-0">MGSi</h3>
+        <h3 class="text-primary mb-0">MGS</h3>
       </a>
       <a href="#" class="mob-toggler"><i class="feather icon-more-vertical"></i></a>
     </div>
@@ -288,7 +586,7 @@
     <div class="pcoded-content">
       <div class="page-hero">
         <div class="container">
-          <h1>Welcome back, Dr. Johnson</h1>
+          <h1>Welcome back, <?= h($lecturer['lecturer_name']) ?></h1>
           <p>Manage your courses, grading tasks, and track student performance</p>
         </div>
       </div>
@@ -299,21 +597,21 @@
           <div class="card stat">
             <div class="icon blue"><i class="fas fa-users"></i></div>
             <div>
-              <div class="value" id="statStudents">0</div>
-              <div class="muted">Students in Classes</div>
+              <div class="value" id="statStudents"><?= $stats['students'] ?></div>
+              <div class="muted">Eligible Students</div>
             </div>
           </div>
           <div class="card stat">
             <div class="icon orange"><i class="fas fa-tasks"></i></div>
             <div>
-              <div class="value" id="statPending">0</div>
+              <div class="value" id="statPending"><?= $stats['pending'] ?></div>
               <div class="muted">Pending Grading Tasks</div>
             </div>
           </div>
           <div class="card stat">
             <div class="icon green"><i class="fas fa-gauge-high"></i></div>
             <div>
-              <div class="value" id="statAverage">0%</div>
+              <div class="value" id="statAverage"><?= $stats['average'] ?>%</div>
               <div class="muted">Average Performance</div>
             </div>
           </div>
@@ -327,11 +625,59 @@
                 <a class="btn btn-outline" href="my-courses.php"><i class="fas fa-arrow-right"></i> View All</a>
               </div>
             </div>
-            <div class="courses" id="coursesList"></div>
+
+            <?php if (empty($grouped_courses)): ?>
+              <div class="no-data">
+                <i class="fas fa-book" style="font-size: 2rem; color: #cbd5e0; margin-bottom: 1rem;"></i>
+                <p>No courses assigned yet. Contact your administrator to get course assignments.</p>
+              </div>
+            <?php else: ?>
+              <div class="courses">
+                <?php foreach (array_slice($grouped_courses, 0, 5) as $course): ?>
+                  <div class="course-row">
+                    <div>
+                      <div style="font-weight:800;color:#2d3748;"><?= h($course['course_code']) ?> - <?= h($course['course_name']) ?></div>
+                      <div class="course-meta">
+                        <span><i class="fas fa-calendar"></i> Sessions: <?= implode(', ', array_unique($course['sessions'])) ?></span>
+                        <span><i class="fas fa-layer-group"></i> Levels: <?= implode(', ', array_unique($course['levels'])) ?></span>
+                        <span><i class="fas fa-user"></i> <?= $course['total_enrolled'] ?> students</span>
+                        <?php if ($course['total_pending'] > 0): ?>
+                          <span style="color: #ed8936;"><i class="fas fa-clock"></i> <?= $course['total_pending'] ?> pending</span>
+                        <?php endif; ?>
+                      </div>
+                    </div>
+                    <div class="actions">
+                      <a class="btn btn-outline" href="enter-grades.php?course=<?= urlencode($course['course_code']) ?>"><i class="fas fa-pen-to-square"></i> Enter Grades</a>
+                      <a class="btn btn-primary" href="student-performance.php?course=<?= urlencode($course['course_code']) ?>"><i class="fas fa-chart-line"></i> Performance</a>
+                    </div>
+                  </div>
+                <?php endforeach; ?>
+              </div>
+            <?php endif; ?>
           </div>
+
           <div class="card">
             <h3 style="margin:0 0 .75rem;color:#2d3748;">Notifications</h3>
-            <div class="list" id="notifList"></div>
+            <div class="list">
+              <?php foreach ($notifications as $notification): ?>
+                <div class="notif">
+                  <?php
+                  $badge_class = $notification['type'];
+                  $icon = match ($notification['type']) {
+                    'deadline' => 'fa-clock',
+                    'warn' => 'fa-triangle-exclamation',
+                    'info' => 'fa-bell',
+                    default => 'fa-bell'
+                  };
+                  ?>
+                  <div class="badge <?= $badge_class ?>"><i class="fas <?= $icon ?>"></i></div>
+                  <div>
+                    <div style="font-weight:600;color:#2d3748;margin-bottom:.2rem"><?= h($notification['text']) ?></div>
+                    <div class="muted"><?= h($notification['time']) ?></div>
+                  </div>
+                </div>
+              <?php endforeach; ?>
+            </div>
           </div>
         </div>
       </div>
@@ -343,106 +689,49 @@
   <script src="../Admin/assets/js/ripple.js"></script>
   <script src="../Admin/assets/js/pcoded.min.js"></script>
   <script>
-    // Demo data (UI only)
-    const lecturer = {
-      name: 'Dr. Johnson'
-    };
-    const stats = {
-      students: 142,
-      pending: 8,
-      average: 78.6
-    };
-    const myCourses = [{
-        code: 'CS101',
-        title: 'Intro to Programming',
-        level: [100, 200],
-        enrolled: 62,
-        pending: 3
-      },
-      {
-        code: 'CS201',
-        title: 'Data Structures',
-        level: [200],
-        enrolled: 48,
-        pending: 2
-      },
-      {
-        code: 'CS301',
-        title: 'Database Systems',
-        level: [300],
-        enrolled: 32,
-        pending: 3
-      },
-    ];
-    const notifications = [{
-        type: 'deadline',
-        text: 'CS201: Test 1 grading due in 2 days',
-        time: 'Due: Sep 20, 2025'
-      },
-      {
-        type: 'warn',
-        text: 'Low submissions in CS301 Project 1',
-        time: '3 hours ago'
-      },
-      {
-        type: 'info',
-        text: 'New student enrolled in CS101',
-        time: 'Today, 09:12 AM'
-      },
-    ];
-
+    // Animate statistics on page load
     function animateValue(el, to, suffix = '') {
       const start = 0;
       const dur = 800;
       const t0 = performance.now();
       const step = (t) => {
         const p = Math.min((t - t0) / dur, 1);
-        el.textContent = (start + (to - start) * p).toFixed(suffix ? 1 : 0) + suffix;
+        const value = (start + (to - start) * p);
+        el.textContent = (suffix === '%' ? value.toFixed(1) : Math.floor(value)) + suffix;
         if (p < 1) requestAnimationFrame(step);
       };
       requestAnimationFrame(step);
     }
 
-    function render() {
-      document.querySelector('.page-hero h1').textContent = `Welcome back, ${lecturer.name}`;
-      animateValue(document.getElementById('statStudents'), stats.students);
-      animateValue(document.getElementById('statPending'), stats.pending);
-      animateValue(document.getElementById('statAverage'), stats.average, '%');
-      const list = document.getElementById('coursesList');
-      list.innerHTML = '';
-      myCourses.forEach(c => {
-        const row = document.createElement('div');
-        row.className = 'course-row';
-        row.innerHTML = `
-          <div>
-            <div style="font-weight:800;color:#2d3748;">${c.code} - ${c.title}</div>
-            <div class="course-meta"><span><i class="fas fa-layer-group"></i> ${c.level.join(', ')}</span><span><i class="fas fa-user"></i> ${c.enrolled} students</span></div>
-          </div>
-          <div class="actions">
-            <a class="btn btn-outline" href="enter-grades.php?course=${c.code}"><i class="fas fa-pen-to-square"></i> Enter Grades</a>
-            <a class="btn btn-primary" href="student-performance.php?course=${c.code}"><i class="fas fa-chart-line"></i> Performance</a>
-          </div>`;
-        list.appendChild(row);
-      });
-      const nList = document.getElementById('notifList');
-      nList.innerHTML = '';
-      notifications.forEach(n => {
-        const bClass = n.type === 'deadline' ? 'deadline' : (n.type === 'warn' ? 'warn' : 'info');
-        const icon = n.type === 'deadline' ? 'fa-clock' : (n.type === 'warn' ? 'fa-triangle-exclamation' : 'fa-bell');
-        const item = document.createElement('div');
-        item.className = 'notif';
-        item.innerHTML = `
-          <div class="badge ${bClass}"><i class="fas ${icon}"></i></div>
-          <div>
-            <div style="font-weight:600;color:#2d3748;margin-bottom:.2rem">${n.text}</div>
-            <div class="muted">${n.time}</div>
-          </div>`;
-        nList.appendChild(item);
-      });
-    }
+    // Initialize animations when page loads
+    window.addEventListener('load', () => {
+      const studentsEl = document.getElementById('statStudents');
+      const pendingEl = document.getElementById('statPending');
+      const averageEl = document.getElementById('statAverage');
 
-    window.addEventListener('load', render);
+      if (studentsEl) animateValue(studentsEl, <?= $stats['students'] ?>);
+      if (pendingEl) animateValue(pendingEl, <?= $stats['pending'] ?>);
+      if (averageEl) animateValue(averageEl, <?= $stats['average'] ?>, '%');
+    });
+
+    // Add loading states for buttons
+    document.querySelectorAll('.btn').forEach(btn => {
+      btn.addEventListener('click', function(e) {
+        if (this.href && !this.href.includes('#') && !this.href.includes('javascript:')) {
+          const originalText = this.innerHTML;
+          this.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading...';
+          this.style.pointerEvents = 'none';
+
+          // Restore button if navigation fails
+          setTimeout(() => {
+            this.innerHTML = originalText;
+            this.style.pointerEvents = 'auto';
+          }, 5000);
+        }
+      });
+    });
   </script>
 </body>
 
 </html>
+</qodoArtifact>

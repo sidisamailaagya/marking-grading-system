@@ -782,19 +782,11 @@ $jsCourseLabels    = json_encode($courseLabels);
                             <span class="pcoded-mtext">Manage Courses</span>
                         </a>
                     </li>
-
                     <li class="nav-item"><a href="assign-courses.php" class=""><span class="pcoded-micon"><i class="fas fa-book"></i></span><span class="pcoded-mtext">Assign Courses</span></a></li>
                     <li class="nav-item">
                         <a href="grading-scale.php" class="nav-link">
                             <span class="pcoded-micon"><i class="fas fa-chart-line"></i></span>
                             <span class="pcoded-mtext">Grading Scale</span>
-                        </a>
-                    </li>
-    
-                    <li class="nav-item">
-                        <a href="system-settings.php" class="nav-link">
-                            <span class="pcoded-micon"><i class="fas fa-cog"></i></span>
-                            <span class="pcoded-mtext">System Settings</span>
                         </a>
                     </li>
                     <li class="nav-item">

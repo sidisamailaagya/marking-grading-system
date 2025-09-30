@@ -1009,13 +1009,47 @@ $lecturers = $mysqli ? lecturers_query($mysqli, $q, $filterDept, $filterStatus) 
         <div class="navbar-wrapper">
             <div class="navbar-content scroll-div">
                 <ul class="nav pcoded-inner-navbar">
-                    <li class="nav-item pcoded-menu-caption"><label>Navigation</label></li>
-                    <li class="nav-item"><a href="dashboard.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-home"></i></span><span class="pcoded-mtext">Dashboard</span></a></li>
-                    <li class="nav-item"><a href="manage-students.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-user-graduate"></i></span><span class="pcoded-mtext">Manage Students</span></a></li>
-                    <li class="nav-item"><a href="manage-lecturers.php" class="nav-link active"><span class="pcoded-micon"><i class="fas fa-chalkboard-teacher"></i></span><span class="pcoded-mtext">Manage Lecturers</span></a></li>
-                    <li class="nav-item"><a href="manage-courses.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-book"></i></span><span class="pcoded-mtext">Manage Courses</span></a></li>
-                    <li class="nav-item"><a href="grading-scale.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-chart-line"></i></span><span class="pcoded-mtext">Grading Scale</span></a></li>
-                    <li class="nav-item"><a href="../logout.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-sign-out-alt"></i></span><span class="pcoded-mtext">Logout</span></a></li>
+                    <li class="nav-item pcoded-menu-caption">
+                        <label>Navigation</label>
+                    </li>
+                    <li class="nav-item">
+                        <a href="dashboard.php" class="nav-link">
+                            <span class="pcoded-micon"><i class="fas fa-home"></i></span>
+                            <span class="pcoded-mtext">Dashboard</span>
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a href="manage-students.php" class="nav-link">
+                            <span class="pcoded-micon"><i class="fas fa-user-graduate"></i></span>
+                            <span class="pcoded-mtext">Manage Students</span>
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a href="manage-lecturers.php" class="nav-link active">
+                            <span class="pcoded-micon"><i class="fas fa-chalkboard-teacher"></i></span>
+                            <span class="pcoded-mtext">Manage Lecturers</span>
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a href="manage-courses.php" class="nav-link">
+                            <span class="pcoded-micon"><i class="fas fa-book"></i></span>
+                            <span class="pcoded-mtext">Manage Courses</span>
+                        </a>
+                    </li>
+
+                    <li class="nav-item"><a href="assign-courses.php" class=""><span class="pcoded-micon"><i class="fas fa-book"></i></span><span class="pcoded-mtext">Assign Courses</span></a></li>
+                    <li class="nav-item">
+                        <a href="grading-scale.php" class="nav-link">
+                            <span class="pcoded-micon"><i class="fas fa-chart-line"></i></span>
+                            <span class="pcoded-mtext">Grading Scale</span>
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a href="../logout.php" class="nav-link">
+                            <span class="pcoded-micon"><i class="fas fa-sign-out-alt"></i></span>
+                            <span class="pcoded-mtext">Logout</span>
+                        </a>
+                    </li>
                 </ul>
             </div>
         </div>

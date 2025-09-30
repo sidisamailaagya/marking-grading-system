@@ -5,7 +5,6 @@ session_start();
 
 /**
  * Auth and DB
- * Adjust paths if your includes live elsewhere.
  */
 require_once __DIR__ . '/../includes/auth.php';
 if (function_exists('require_admin')) {
@@ -68,6 +67,81 @@ if (!$mysqli) {
 }
 
 /**
+ * Create missing tables if they don't exist
+ */
+if ($mysqli) {
+    // Check if levels table exists, if not create it
+    $result = $mysqli->query("SHOW TABLES LIKE 'levels'");
+    if ($result->num_rows == 0) {
+        // Create levels table only if it doesn't exist
+        $mysqli->query("CREATE TABLE levels (
+            level_id INT PRIMARY KEY AUTO_INCREMENT,
+            level_name VARCHAR(10) NOT NULL UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )");
+
+        // Insert default levels for new table
+        $mysqli->query("INSERT INTO levels (level_name) VALUES
+            ('100'), ('200'), ('300'), ('400'), ('500'), ('600')");
+    } else {
+        // Table exists, just insert missing levels if any
+        $mysqli->query("INSERT IGNORE INTO levels (level_name) VALUES
+            ('100'), ('200'), ('300'), ('400'), ('500'), ('600')");
+    }
+
+    // Check if course_assignments table exists
+    $result = $mysqli->query("SHOW TABLES LIKE 'course_assignments'");
+    if ($result->num_rows == 0) {
+        // Create course_assignments table with session column
+        $mysqli->query("CREATE TABLE course_assignments (
+            assignment_id INT PRIMARY KEY AUTO_INCREMENT,
+            lecturer_id INT NOT NULL,
+            course_id INT NOT NULL,
+            dept_id INT NOT NULL,
+            level_id INT NOT NULL,
+            session VARCHAR(50) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_assignment (lecturer_id, course_id, dept_id, level_id, session),
+            INDEX idx_lecturer (lecturer_id),
+            INDEX idx_course (course_id),
+            INDEX idx_dept (dept_id),
+            INDEX idx_level (level_id),
+            INDEX idx_session (session)
+        )");
+    } else {
+        // Table exists, check if it has session column
+        $columns = $mysqli->query("SHOW COLUMNS FROM course_assignments LIKE 'session'");
+        if ($columns->num_rows == 0) {
+            // Add session column if it doesn't exist
+            $mysqli->query("ALTER TABLE course_assignments ADD COLUMN session VARCHAR(50) NOT NULL DEFAULT '2023/2024'");
+
+            // Check if session_id column exists and migrate data
+            $sessionIdColumns = $mysqli->query("SHOW COLUMNS FROM course_assignments LIKE 'session_id'");
+            if ($sessionIdColumns->num_rows > 0) {
+                // Migrate data from session_id to session (if academic_sessions table exists)
+                $sessionTableExists = $mysqli->query("SHOW TABLES LIKE 'academic_sessions'");
+                if ($sessionTableExists->num_rows > 0) {
+                    $mysqli->query("UPDATE course_assignments ca 
+                                   LEFT JOIN academic_sessions s ON s.session_id = ca.session_id 
+                                   SET ca.session = COALESCE(s.session_name, '2023/2024')");
+                }
+
+                // Drop the old session_id column and related constraints
+                $mysqli->query("ALTER TABLE course_assignments DROP FOREIGN KEY IF EXISTS fk_assignment_session");
+                $mysqli->query("ALTER TABLE course_assignments DROP COLUMN session_id");
+            }
+
+            // Update unique constraint to include session instead of session_id
+            $mysqli->query("ALTER TABLE course_assignments DROP INDEX IF EXISTS unique_assignment");
+            $mysqli->query("ALTER TABLE course_assignments ADD UNIQUE KEY unique_assignment (lecturer_id, course_id, dept_id, level_id, session)");
+
+            // Add index for session
+            $mysqli->query("ALTER TABLE course_assignments ADD INDEX idx_session (session)");
+        }
+    }
+}
+
+/**
  * Dictionaries
  */
 function fetch_faculties(mysqli $db): array
@@ -100,59 +174,128 @@ function fetch_levels(mysqli $db): array
     return $rows;
 }
 
+function fetch_lecturers(mysqli $db): array
+{
+    $rows = [];
+    if ($res = $db->query("SELECT l.lecturer_id, l.lecturer_name, l.staff_no, l.faculty_id, l.dept_id, 
+                                  f.faculty_name, d.dept_name 
+                           FROM lecturers l 
+                           LEFT JOIN faculties f ON f.faculty_id = l.faculty_id 
+                           LEFT JOIN departments d ON d.dept_id = l.dept_id 
+                           ORDER BY l.lecturer_name ASC")) {
+        while ($r = $res->fetch_assoc()) $rows[] = $r;
+        $res->free();
+    }
+    return $rows;
+}
+
+function fetch_courses(mysqli $db): array
+{
+    $rows = [];
+    if ($res = $db->query("SELECT c.course_id, c.course_name, c.course_code, c.dept_id, c.level_id,
+                                  d.dept_name, l.level_name
+                           FROM courses c 
+                           LEFT JOIN departments d ON d.dept_id = c.dept_id
+                           LEFT JOIN levels l ON l.level_id = c.level_id
+                           ORDER BY c.course_code ASC")) {
+        while ($r = $res->fetch_assoc()) $rows[] = $r;
+        $res->free();
+    }
+    return $rows;
+}
+
+function fetch_sessions(mysqli $db): array
+{
+    $rows = [];
+
+    // Check if course_assignments table exists and has session column
+    $tableExists = $db->query("SHOW TABLES LIKE 'course_assignments'");
+    if ($tableExists->num_rows == 0) {
+        return $rows; // Return empty array if table doesn't exist
+    }
+
+    $columnExists = $db->query("SHOW COLUMNS FROM course_assignments LIKE 'session'");
+    if ($columnExists->num_rows == 0) {
+        return $rows; // Return empty array if session column doesn't exist
+    }
+
+    // Query distinct sessions
+    if ($res = $db->query("SELECT DISTINCT session FROM course_assignments WHERE session IS NOT NULL AND session != '' ORDER BY session DESC")) {
+        while ($r = $res->fetch_assoc()) $rows[] = $r;
+        $res->free();
+    }
+    return $rows;
+}
+
 /**
  * Validation
  */
-function validate_student_post(array $src, array $levelsDict): array
+function validate_assignment_post(array $src): array
 {
     $errors = [];
-    $student_id = trim((string)($src['student_id'] ?? ''));
-    $full_name  = trim((string)($src['full_name'] ?? ''));
-    $matric_no  = trim((string)($src['matric_no'] ?? ''));
-    $email      = trim((string)($src['email'] ?? ''));
-    $faculty_id = trim((string)($src['faculty_id'] ?? ''));
-    $dept_id    = trim((string)($src['dept_id'] ?? ''));
-    $level      = trim((string)($src['level'] ?? ''));
-    $enrolled   = trim((string)($src['enrolled'] ?? ''));
+    $assignment_id = trim((string)($src['assignment_id'] ?? ''));
+    $lecturer_id   = trim((string)($src['lecturer_id'] ?? ''));
+    $course_id     = trim((string)($src['course_id'] ?? ''));
+    $dept_id       = trim((string)($src['dept_id'] ?? ''));
+    $level_id      = trim((string)($src['level_id'] ?? ''));
+    $session       = trim((string)($src['session'] ?? ''));
 
-    if ($full_name === '') $errors['full_name'] = 'Full name is required';
-    if ($matric_no === '') $errors['matric_no'] = 'Matric number is required';
-    if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        $errors['email'] = 'Invalid email address';
-    }
-    if ($faculty_id === '' || !ctype_digit($faculty_id)) $errors['faculty_id'] = 'Select a valid faculty';
+    if ($lecturer_id === '' || !ctype_digit($lecturer_id)) $errors['lecturer_id'] = 'Select a valid lecturer';
+    if ($course_id === '' || !ctype_digit($course_id)) $errors['course_id'] = 'Select a valid course';
     if ($dept_id === '' || !ctype_digit($dept_id)) $errors['dept_id'] = 'Select a valid department';
-    if ($level === '' || !ctype_digit($level) || !isset($levelsDict[(int)$level])) {
-        $errors['level'] = 'Select a valid level';
-    }
-    if ($enrolled !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $enrolled)) {
-        $errors['enrolled'] = 'Invalid enrolled date';
-    }
+    if ($level_id === '' || !ctype_digit($level_id)) $errors['level_id'] = 'Select a valid level';
+    if ($session === '') $errors['session'] = 'Enter a valid session (e.g., 2023/2024)';
 
     $data = [
-        'student_id' => $student_id,
-        'full_name'  => $full_name,
-        'matric_no'  => $matric_no,
-        'email'      => $email,
-        'faculty_id' => $faculty_id === '' ? null : (int)$faculty_id,
-        'dept_id'    => $dept_id === '' ? null : (int)$dept_id,
-        'level'      => $level === '' ? null : (int)$level,
-        'enrolled'   => $enrolled, // YYYY-MM-DD or ''
+        'assignment_id' => $assignment_id,
+        'lecturer_id'   => $lecturer_id === '' ? null : (int)$lecturer_id,
+        'course_id'     => $course_id === '' ? null : (int)$course_id,
+        'dept_id'       => $dept_id === '' ? null : (int)$dept_id,
+        'level_id'      => $level_id === '' ? null : (int)$level_id,
+        'session'       => $session,
     ];
 
     return [$data, $errors];
 }
 
 /**
- * Unique check
+ * Business Logic Validation
  */
-function matric_exists(mysqli $db, string $matric_no, ?int $exclude_id = null): bool
+function validate_lecturer_department_match(mysqli $db, int $lecturer_id, int $dept_id): bool
 {
-    $sql = "SELECT student_id FROM students WHERE matric_no = ?" . ($exclude_id ? " AND student_id <> ?" : "") . " LIMIT 1";
+    $sql = "SELECT l.dept_id, l.faculty_id, d.faculty_id as dept_faculty_id 
+            FROM lecturers l 
+            JOIN departments d ON d.dept_id = ? 
+            WHERE l.lecturer_id = ?";
+    $stmt = $db->prepare($sql);
+    if (!$stmt) return false;
+
+    $stmt->bind_param('ii', $dept_id, $lecturer_id);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $row = $res->fetch_assoc();
+    $stmt->close();
+
+    if (!$row) return false;
+
+    // Lecturer can teach in their own department OR any department in their faculty
+    return ($row['dept_id'] == $dept_id) || ($row['faculty_id'] == $row['dept_faculty_id']);
+}
+
+function assignment_exists(mysqli $db, int $lecturer_id, int $course_id, int $dept_id, int $level_id, string $session, ?int $exclude_id = null): bool
+{
+    $sql = "SELECT assignment_id FROM course_assignments 
+            WHERE lecturer_id = ? AND course_id = ? AND dept_id = ? AND level_id = ? AND session = ?"
+        . ($exclude_id ? " AND assignment_id <> ?" : "") . " LIMIT 1";
     $stmt = $db->prepare($sql);
     if (!$stmt) return true;
-    if ($exclude_id) $stmt->bind_param('si', $matric_no, $exclude_id);
-    else $stmt->bind_param('s', $matric_no);
+
+    if ($exclude_id) {
+        $stmt->bind_param('iiiisi', $lecturer_id, $course_id, $dept_id, $level_id, $session, $exclude_id);
+    } else {
+        $stmt->bind_param('iiiis', $lecturer_id, $course_id, $dept_id, $level_id, $session);
+    }
+
     $stmt->execute();
     $res = $stmt->get_result();
     $exists = (bool)$res->fetch_row();
@@ -161,33 +304,26 @@ function matric_exists(mysqli $db, string $matric_no, ?int $exclude_id = null): 
 }
 
 /**
- * CRUD
+ * CRUD Operations
  */
-function student_create(mysqli $db, array $d): array
+function assignment_create(mysqli $db, array $d): array
 {
-    if (matric_exists($db, $d['matric_no'])) {
-        return [false, 'Matric number already exists'];
+    // Validate lecturer-department relationship
+    if (!validate_lecturer_department_match($db, $d['lecturer_id'], $d['dept_id'])) {
+        return [false, 'Lecturer can only be assigned to courses in their faculty'];
     }
 
-    // Insert without password column (let it use its default value)
-    $sql = "INSERT INTO students (matric_no, full_name, email, faculty_id, dept_id, level, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)";
+    // Check for duplicate assignment
+    if (assignment_exists($db, $d['lecturer_id'], $d['course_id'], $d['dept_id'], $d['level_id'], $d['session'])) {
+        return [false, 'This assignment already exists'];
+    }
+
+    $sql = "INSERT INTO course_assignments (lecturer_id, course_id, dept_id, level_id, session, created_at)
+            VALUES (?, ?, ?, ?, ?, NOW())";
     $stmt = $db->prepare($sql);
     if (!$stmt) return [false, 'Failed to prepare statement'];
 
-    $created_at = $d['enrolled'] ? ($d['enrolled'] . ' 00:00:00') : date('Y-m-d H:i:s');
-
-    // Bind params: s s s i i i s (7 params, removed password)
-    $stmt->bind_param(
-        'sssiiss',
-        $d['matric_no'],
-        $d['full_name'],
-        $d['email'],
-        $d['faculty_id'],
-        $d['dept_id'],
-        $d['level'],
-        $created_at
-    );
+    $stmt->bind_param('iiiis', $d['lecturer_id'], $d['course_id'], $d['dept_id'], $d['level_id'], $d['session']);
 
     if (!$stmt->execute()) {
         $err = 'DB error: ' . $db->error;
@@ -198,32 +334,31 @@ function student_create(mysqli $db, array $d): array
     $stmt->close();
     return [true, $newId];
 }
-function student_update(mysqli $db, array $d): array
+
+function assignment_update(mysqli $db, array $d): array
 {
-    if (empty($d['student_id']) || !ctype_digit((string)$d['student_id'])) {
-        return [false, 'Invalid student ID'];
+    if (empty($d['assignment_id']) || !ctype_digit((string)$d['assignment_id'])) {
+        return [false, 'Invalid assignment ID'];
     }
-    $id = (int)$d['student_id'];
-    if (matric_exists($db, $d['matric_no'], $id)) {
-        return [false, 'Matric number already exists'];
+    $id = (int)$d['assignment_id'];
+
+    // Validate lecturer-department relationship
+    if (!validate_lecturer_department_match($db, $d['lecturer_id'], $d['dept_id'])) {
+        return [false, 'Lecturer can only be assigned to courses in their faculty'];
     }
 
-    $sql = "UPDATE students
-          SET matric_no = ?, full_name = ?, email = ?, faculty_id = ?, dept_id = ?, level = ?
-          WHERE student_id = ?";
+    // Check for duplicate assignment (excluding current)
+    if (assignment_exists($db, $d['lecturer_id'], $d['course_id'], $d['dept_id'], $d['level_id'], $d['session'], $id)) {
+        return [false, 'This assignment already exists'];
+    }
+
+    $sql = "UPDATE course_assignments 
+            SET lecturer_id = ?, course_id = ?, dept_id = ?, level_id = ?, session = ?
+            WHERE assignment_id = ?";
     $stmt = $db->prepare($sql);
     if (!$stmt) return [false, 'Failed to prepare statement'];
 
-    $stmt->bind_param(
-        'sssiisi',
-        $d['matric_no'],
-        $d['full_name'],
-        $d['email'],
-        $d['faculty_id'],
-        $d['dept_id'],
-        $d['level'],
-        $id
-    );
+    $stmt->bind_param('iiiisi', $d['lecturer_id'], $d['course_id'], $d['dept_id'], $d['level_id'], $d['session'], $id);
 
     if (!$stmt->execute()) {
         $err = 'DB error: ' . $db->error;
@@ -235,14 +370,14 @@ function student_update(mysqli $db, array $d): array
     return [true, $affected];
 }
 
-function student_delete(mysqli $db, string $student_id): array
+function assignment_delete(mysqli $db, string $assignment_id): array
 {
-    if ($student_id === '' || !ctype_digit((string)$student_id)) {
-        return [false, 'Invalid student ID'];
+    if ($assignment_id === '' || !ctype_digit((string)$assignment_id)) {
+        return [false, 'Invalid assignment ID'];
     }
-    $id = (int)$student_id;
+    $id = (int)$assignment_id;
 
-    $sql = "DELETE FROM students WHERE student_id = ?";
+    $sql = "DELETE FROM course_assignments WHERE assignment_id = ?";
     $stmt = $db->prepare($sql);
     if (!$stmt) return [false, 'Failed to prepare statement'];
 
@@ -261,49 +396,63 @@ function student_delete(mysqli $db, string $student_id): array
 /**
  * Listing with search/filters/pagination
  */
-function students_query(mysqli $db, string $q, ?int $faculty_id, ?int $dept_id, ?int $level, int $offset, int $limit): array
+function assignments_query(mysqli $db, string $q, ?int $lecturer_id, ?int $course_id, ?int $dept_id, ?int $level_id, ?string $session, int $offset, int $limit): array
 {
     $where = [];
     $params = [];
     $types = '';
 
     if ($q !== '') {
-        $where[] = "(s.full_name LIKE ? OR s.matric_no LIKE ?)";
+        $where[] = "(l.lecturer_name LIKE ? OR c.course_name LIKE ? OR c.course_code LIKE ?)";
         $like = "%$q%";
         $params[] = $like;
         $types .= 's';
         $params[] = $like;
         $types .= 's';
+        $params[] = $like;
+        $types .= 's';
     }
-    if ($faculty_id) {
-        $where[] = "s.faculty_id = ?";
-        $params[] = $faculty_id;
+    if ($lecturer_id) {
+        $where[] = "ca.lecturer_id = ?";
+        $params[] = $lecturer_id;
+        $types .= 'i';
+    }
+    if ($course_id) {
+        $where[] = "ca.course_id = ?";
+        $params[] = $course_id;
         $types .= 'i';
     }
     if ($dept_id) {
-        $where[] = "s.dept_id = ?";
+        $where[] = "ca.dept_id = ?";
         $params[] = $dept_id;
         $types .= 'i';
     }
-    if ($level) {
-        $where[] = "s.level = ?";
-        $params[] = $level;
+    if ($level_id) {
+        $where[] = "ca.level_id = ?";
+        $params[] = $level_id;
         $types .= 'i';
+    }
+    if ($session) {
+        $where[] = "ca.session LIKE ?";
+        $params[] = "%$session%";
+        $types .= 's';
     }
     $whereSql = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
 
     $sql = "SELECT
-            s.student_id, s.matric_no, s.full_name, s.email,
-            s.faculty_id, f.faculty_name,
-            s.dept_id, d.dept_name,
-            s.level, l.level_name,
-            s.created_at
-          FROM students s
-          LEFT JOIN faculties f ON f.faculty_id = s.faculty_id
-          LEFT JOIN departments d ON d.dept_id = s.dept_id
-          LEFT JOIN levels l ON l.level_id = s.level
+            ca.assignment_id, ca.lecturer_id, ca.course_id, ca.dept_id, ca.level_id, ca.session,
+            l.lecturer_name, l.staff_no,
+            c.course_name, c.course_code,
+            d.dept_name,
+            lv.level_name,
+            ca.created_at
+          FROM course_assignments ca
+          LEFT JOIN lecturers l ON l.lecturer_id = ca.lecturer_id
+          LEFT JOIN courses c ON c.course_id = ca.course_id
+          LEFT JOIN departments d ON d.dept_id = ca.dept_id
+          LEFT JOIN levels lv ON lv.level_id = ca.level_id
           $whereSql
-          ORDER BY s.created_at DESC, s.student_id DESC
+          ORDER BY ca.created_at DESC, ca.assignment_id DESC
           LIMIT ?, ?";
     $stmt = $db->prepare($sql);
     if (!$stmt) return [];
@@ -322,38 +471,54 @@ function students_query(mysqli $db, string $q, ?int $faculty_id, ?int $dept_id, 
     return $rows;
 }
 
-function students_count(mysqli $db, string $q, ?int $faculty_id, ?int $dept_id, ?int $level): int
+function assignments_count(mysqli $db, string $q, ?int $lecturer_id, ?int $course_id, ?int $dept_id, ?int $level_id, ?string $session): int
 {
     $where = [];
     $params = [];
     $types = '';
 
     if ($q !== '') {
-        $where[] = "(s.full_name LIKE ? OR s.matric_no LIKE ?)";
+        $where[] = "(l.lecturer_name LIKE ? OR c.course_name LIKE ? OR c.course_code LIKE ?)";
         $like = "%$q%";
         $params[] = $like;
         $types .= 's';
         $params[] = $like;
         $types .= 's';
+        $params[] = $like;
+        $types .= 's';
     }
-    if ($faculty_id) {
-        $where[] = "s.faculty_id = ?";
-        $params[] = $faculty_id;
+    if ($lecturer_id) {
+        $where[] = "ca.lecturer_id = ?";
+        $params[] = $lecturer_id;
+        $types .= 'i';
+    }
+    if ($course_id) {
+        $where[] = "ca.course_id = ?";
+        $params[] = $course_id;
         $types .= 'i';
     }
     if ($dept_id) {
-        $where[] = "s.dept_id = ?";
+        $where[] = "ca.dept_id = ?";
         $params[] = $dept_id;
         $types .= 'i';
     }
-    if ($level) {
-        $where[] = "s.level = ?";
-        $params[] = $level;
+    if ($level_id) {
+        $where[] = "ca.level_id = ?";
+        $params[] = $level_id;
         $types .= 'i';
+    }
+    if ($session) {
+        $where[] = "ca.session LIKE ?";
+        $params[] = "%$session%";
+        $types .= 's';
     }
     $whereSql = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
 
-    $sql = "SELECT COUNT(*) AS c FROM students s $whereSql";
+    $sql = "SELECT COUNT(*) AS c FROM course_assignments ca
+            LEFT JOIN lecturers l ON l.lecturer_id = ca.lecturer_id
+            LEFT JOIN courses c ON c.course_id = ca.course_id
+            LEFT JOIN departments d ON d.dept_id = ca.dept_id
+            $whereSql";
     $stmt = $db->prepare($sql);
     if (!$stmt) return 0;
 
@@ -377,13 +542,8 @@ if ($mysqli && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!hash_equals($_SESSION['csrf'] ?? '', $csrf)) {
         $flashError = 'Invalid CSRF token.';
     } else {
-        // Load levels dict for validation
-        $levelsList = fetch_levels($mysqli);
-        $levelsDict = [];
-        foreach ($levelsList as $lv) $levelsDict[(int)$lv['level_id']] = $lv['level_name'];
-
         if ($op === 'create' || $op === 'update') {
-            [$data, $errs] = validate_student_post($_POST, $levelsDict);
+            [$data, $errs] = validate_assignment_post($_POST);
             if (!empty($errs)) {
                 $formErrors = $errs;
                 $old = $data;
@@ -391,10 +551,10 @@ if ($mysqli && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 $modalMode = $op;
             } else {
                 if ($op === 'create') {
-                    [$ok, $result] = student_create($mysqli, $data);
+                    [$ok, $result] = assignment_create($mysqli, $data);
                     if ($ok) {
-                        $_SESSION['flash_success'] = 'Student added successfully.';
-                        header('Location: manage-students.php');
+                        $_SESSION['flash_success'] = 'Course assignment created successfully.';
+                        header('Location: assign-courses.php');
                         exit;
                     } else {
                         $flashError = $result;
@@ -404,10 +564,10 @@ if ($mysqli && $_SERVER['REQUEST_METHOD'] === 'POST') {
                         $modalMode = 'create';
                     }
                 } else {
-                    [$ok, $result] = student_update($mysqli, $data);
+                    [$ok, $result] = assignment_update($mysqli, $data);
                     if ($ok) {
-                        $_SESSION['flash_success'] = 'Student updated successfully.';
-                        header('Location: manage-students.php');
+                        $_SESSION['flash_success'] = 'Course assignment updated successfully.';
+                        header('Location: assign-courses.php');
                         exit;
                     } else {
                         $flashError = $result;
@@ -419,11 +579,11 @@ if ($mysqli && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
         } elseif ($op === 'delete') {
-            $student_id = $_POST['student_id'] ?? '';
-            [$ok, $result] = student_delete($mysqli, $student_id);
+            $assignment_id = $_POST['assignment_id'] ?? '';
+            [$ok, $result] = assignment_delete($mysqli, $assignment_id);
             if ($ok) {
-                $_SESSION['flash_success'] = 'Student deleted successfully.';
-                header('Location: manage-students.php');
+                $_SESSION['flash_success'] = 'Course assignment deleted successfully.';
+                header('Location: assign-courses.php');
                 exit;
             } else {
                 $flashError = $result;
@@ -438,18 +598,23 @@ if ($mysqli && $_SERVER['REQUEST_METHOD'] === 'POST') {
 $faculties   = $mysqli ? fetch_faculties($mysqli)   : [];
 $departments = $mysqli ? fetch_departments($mysqli) : [];
 $levels      = $mysqli ? fetch_levels($mysqli)      : [];
+$lecturers   = $mysqli ? fetch_lecturers($mysqli)   : [];
+$courses     = $mysqli ? fetch_courses($mysqli)     : [];
+$sessions    = $mysqli ? fetch_sessions($mysqli)    : [];
 
-$q          = isset($_GET['q']) ? trim((string)$_GET['q']) : '';
-$filterFac  = isset($_GET['faculty_id']) && ctype_digit((string)$_GET['faculty_id']) ? (int)$_GET['faculty_id'] : null;
-$filterDept = isset($_GET['dept_id'])    && ctype_digit((string)$_GET['dept_id'])    ? (int)$_GET['dept_id']    : null;
-$filterLvl  = isset($_GET['level'])      && ctype_digit((string)$_GET['level'])      ? (int)$_GET['level']      : null;
+$q             = isset($_GET['q']) ? trim((string)$_GET['q']) : '';
+$filterLec     = isset($_GET['lecturer_id']) && ctype_digit((string)$_GET['lecturer_id']) ? (int)$_GET['lecturer_id'] : null;
+$filterCourse  = isset($_GET['course_id'])   && ctype_digit((string)$_GET['course_id'])   ? (int)$_GET['course_id']   : null;
+$filterDept    = isset($_GET['dept_id'])     && ctype_digit((string)$_GET['dept_id'])     ? (int)$_GET['dept_id']     : null;
+$filterLevel   = isset($_GET['level_id'])    && ctype_digit((string)$_GET['level_id'])    ? (int)$_GET['level_id']    : null;
+$filterSession = isset($_GET['session'])     ? trim((string)$_GET['session'])             : null;
 
 $page    = max(1, (int)($_GET['page'] ?? 1));
 $perPage = 10;
 $offset  = ($page - 1) * $perPage;
 
-$total    = $mysqli ? students_count($mysqli, $q, $filterFac, $filterDept, $filterLvl) : 0;
-$students = $mysqli ? students_query($mysqli, $q, $filterFac, $filterDept, $filterLvl, $offset, $perPage) : [];
+$total       = $mysqli ? assignments_count($mysqli, $q, $filterLec, $filterCourse, $filterDept, $filterLevel, $filterSession) : 0;
+$assignments = $mysqli ? assignments_query($mysqli, $q, $filterLec, $filterCourse, $filterDept, $filterLevel, $filterSession, $offset, $perPage) : [];
 
 /**
  * Pagination helpers
@@ -472,7 +637,7 @@ function build_query(array $params): string
 <html lang="en">
 
 <head>
-    <title>Manage Students - Marking & Grading System</title>
+    <title>Assign Courses - Marking & Grading System</title>
     <!-- HTML5 Shim and Respond.js IE11 support of HTML5 elements and media queries -->
     <!--[if lt IE 11]>
         <script src="https://oss.maxcdn.com/libs/html5shiv/3.7.0/html5shiv.js"></script>
@@ -482,8 +647,8 @@ function build_query(array $params): string
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=0, minimal-ui">
     <meta http-equiv="X-UA-Compatible" content="IE=edge" />
-    <meta name="description" content="Professional Student Management System" />
-    <meta name="keywords" content="students, management, education, dashboard">
+    <meta name="description" content="Professional Course Assignment Management System" />
+    <meta name="keywords" content="courses, assignments, lecturers, education, dashboard">
     <meta name="author" content="Marking & Grading System" />
     <!-- Favicon icon -->
     <link rel="icon" href="assets/images/favicon.ico" type="image/x-icon">
@@ -642,7 +807,7 @@ function build_query(array $params): string
             margin-top: 0;
         }
 
-        .students-container {
+        .assignments-container {
             padding: 2rem;
             max-width: 1400px;
             margin: 0 auto;
@@ -716,7 +881,7 @@ function build_query(array $params): string
         }
 
         /* Table */
-        .students-table-container {
+        .assignments-table-container {
             background: white;
             border-radius: var(--border-radius);
             box-shadow: var(--card-shadow);
@@ -910,6 +1075,13 @@ function build_query(array $params): string
             box-shadow: 0 0 0 3px rgba(102, 126, 234, .1);
         }
 
+        .form-input:disabled,
+        .form-select:disabled {
+            background: #f1f5f9;
+            color: #718096;
+            cursor: not-allowed;
+        }
+
         .modal-actions {
             display: flex;
             gap: .6rem;
@@ -919,7 +1091,7 @@ function build_query(array $params): string
 
         /* Responsive */
         @media (max-width: 768px) {
-            .students-container {
+            .assignments-container {
                 padding: 1rem;
             }
 
@@ -953,47 +1125,15 @@ function build_query(array $params): string
         <div class="navbar-wrapper">
             <div class="navbar-content scroll-div">
                 <ul class="nav pcoded-inner-navbar">
-                    <li class="nav-item pcoded-menu-caption">
-                        <label>Navigation</label>
-                    </li>
-                    <li class="nav-item">
-                        <a href="dashboard.php" class="nav-link">
-                            <span class="pcoded-micon"><i class="fas fa-home"></i></span>
-                            <span class="pcoded-mtext">Dashboard</span>
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a href="manage-students.php" class="nav-link">
-                            <span class="pcoded-micon"><i class="fas fa-user-graduate"></i></span>
-                            <span class="pcoded-mtext">Manage Students</span>
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a href="manage-lecturers.php" class="nav-link">
-                            <span class="pcoded-micon"><i class="fas fa-chalkboard-teacher"></i></span>
-                            <span class="pcoded-mtext">Manage Lecturers</span>
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a href="manage-courses.php" class="nav-link">
-                            <span class="pcoded-micon"><i class="fas fa-book"></i></span>
-                            <span class="pcoded-mtext">Manage Courses</span>
-                        </a>
-                    </li>
-
-                    <li class="nav-item"><a href="assign-courses.php" class=""><span class="pcoded-micon"><i class="fas fa-book"></i></span><span class="pcoded-mtext">Assign Courses</span></a></li>
-                    <li class="nav-item">
-                        <a href="grading-scale.php" class="nav-link">
-                            <span class="pcoded-micon"><i class="fas fa-chart-line"></i></span>
-                            <span class="pcoded-mtext">Grading Scale</span>
-                        </a>
-                    </li>
-                    <li class="nav-item">
-                        <a href="../logout.php" class="nav-link">
-                            <span class="pcoded-micon"><i class="fas fa-sign-out-alt"></i></span>
-                            <span class="pcoded-mtext">Logout</span>
-                        </a>
-                    </li>
+                    <li class="nav-item pcoded-menu-caption"><label>Navigation</label></li>
+                    <li class="nav-item"><a href="dashboard.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-home"></i></span><span class="pcoded-mtext">Dashboard</span></a></li>
+                    <li class="nav-item"><a href="manage-students.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-user-graduate"></i></span><span class="pcoded-mtext">Manage Students</span></a></li>
+                    <li class="nav-item"><a href="manage-lecturers.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-chalkboard-teacher"></i></span><span class="pcoded-mtext">Manage Lecturers</span></a></li>
+                    <li class="nav-item"><a href="manage-courses.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-book"></i></span><span class="pcoded-mtext">Manage Courses</span></a></li>
+                    <li class="nav-item"><a href="assign-courses.php" class="nav-link active"><span class="pcoded-micon"><i class="fas fa-user-tie"></i></span><span class="pcoded-mtext">Assign Courses</span></a></li>
+                    <li class="nav-item"><a href="grading-scale.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-chart-line"></i></span><span class="pcoded-mtext">Grading Scale</span></a></li>
+                    <li class="nav-item"><a href="system-settings.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-cog"></i></span><span class="pcoded-mtext">System Settings</span></a></li>
+                    <li class="nav-item"><a href="logout.php" class="nav-link"><span class="pcoded-micon"><i class="fas fa-sign-out-alt"></i></span><span class="pcoded-mtext">Logout</span></a></li>
                 </ul>
             </div>
         </div>
@@ -1019,14 +1159,14 @@ function build_query(array $params): string
             <div class="page-header">
                 <div class="container-fluid">
                     <div class="page-content text-center">
-                        <h1 class="page-title">Manage Students</h1>
-                        <p class="page-subtitle">Register, edit, and organize student records. Only existing students can create accounts later.</p>
+                        <h1 class="page-title">Course Assignments</h1>
+                        <p class="page-subtitle">Assign lecturers to courses for specific departments, levels, and academic sessions.</p>
                     </div>
                 </div>
             </div>
 
-            <!-- Students Content -->
-            <div class="students-container">
+            <!-- Assignments Content -->
+            <div class="assignments-container">
                 <?php if ($flashSuccess): ?>
                     <div class="alert alert-success" style="background: rgba(72,187,120,.12); color:#2f855a; border: 1px solid rgba(72,187,120,.25); padding: .8rem 1rem; border-radius: 10px; margin-bottom: 12px;"><?= h($flashSuccess) ?></div>
                 <?php endif; ?>
@@ -1037,94 +1177,97 @@ function build_query(array $params): string
                 <!-- Action Bar -->
                 <div class="action-bar">
                     <form class="action-form" method="get" action="">
-                        <input type="text" name="q" value="<?= h($q) ?>" class="search-input" placeholder="Search by name or matric no...">
-                        <select name="faculty_id" id="filterFaculty" class="filter-select">
-                            <option value="">All Faculties</option>
-                            <?php foreach ($faculties as $f): ?>
-                                <option value="<?= (int)$f['faculty_id'] ?>" <?= ($filterFac && $filterFac === (int)$f['faculty_id']) ? 'selected' : '' ?>><?= h($f['faculty_name']) ?></option>
+                        <input type="text" name="q" value="<?= h($q) ?>" class="search-input" placeholder="Search lecturer, course...">
+                        <select name="lecturer_id" class="filter-select">
+                            <option value="">All Lecturers</option>
+                            <?php foreach ($lecturers as $l): ?>
+                                <option value="<?= (int)$l['lecturer_id'] ?>" <?= ($filterLec && $filterLec === (int)$l['lecturer_id']) ? 'selected' : '' ?>><?= h($l['lecturer_name']) ?> (<?= h($l['staff_no']) ?>)</option>
                             <?php endforeach; ?>
                         </select>
-                        <select name="dept_id" id="filterDept" class="filter-select">
+                        <select name="course_id" class="filter-select">
+                            <option value="">All Courses</option>
+                            <?php foreach ($courses as $c): ?>
+                                <option value="<?= (int)$c['course_id'] ?>" <?= ($filterCourse && $filterCourse === (int)$c['course_id']) ? 'selected' : '' ?>><?= h($c['course_code']) ?> - <?= h($c['course_name']) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <select name="dept_id" class="filter-select">
                             <option value="">All Departments</option>
                             <?php foreach ($departments as $d): ?>
-                                <option value="<?= (int)$d['dept_id'] ?>" data-faculty="<?= (int)$d['faculty_id'] ?>" <?= ($filterDept && $filterDept === (int)$d['dept_id']) ? 'selected' : '' ?>><?= h($d['dept_name']) ?></option>
+                                <option value="<?= (int)$d['dept_id'] ?>" <?= ($filterDept && $filterDept === (int)$d['dept_id']) ? 'selected' : '' ?>><?= h($d['dept_name']) ?></option>
                             <?php endforeach; ?>
                         </select>
-                        <select name="level" class="filter-select">
-                            <option value="">All Levels</option>
-                            <?php foreach ($levels as $lv): ?>
-                                <option value="<?= (int)$lv['level_id'] ?>" <?= ($filterLvl && $filterLvl === (int)$lv['level_id']) ? 'selected' : '' ?>><?= h($lv['level_name']) ?></option>
-                            <?php endforeach; ?>
-                        </select>
+                        <input type="text" name="session" value="<?= h($filterSession ?? '') ?>" class="search-input" placeholder="Session (e.g., 2023/2024)">
                         <button type="submit" class="btn btn-muted">Apply</button>
-                        <?php if ($q !== '' || $filterFac || $filterDept || $filterLvl): ?>
-                            <a href="manage-students.php" class="btn btn-muted">Reset</a>
+                        <?php if ($q !== '' || $filterLec || $filterCourse || $filterDept || $filterLevel || $filterSession): ?>
+                            <a href="assign-courses.php" class="btn btn-muted">Reset</a>
                         <?php endif; ?>
                     </form>
                     <div class="action-buttons">
-                        <button class="btn btn-primary" id="openAddStudent" type="button">
+                        <button class="btn btn-primary" id="openAddAssignment" type="button">
                             <i class="fas fa-plus"></i>
-                            Add Student
+                            Assign Course
                         </button>
                     </div>
                 </div>
 
-                <!-- Students Table -->
-                <div class="students-table-container">
+                <!-- Assignments Table -->
+                <div class="assignments-table-container">
                     <div class="table-header">
-                        <h3 class="table-title">Student Records</h3>
+                        <h3 class="table-title">Course Assignments</h3>
                         <div class="table-stats">
-                            <?= $total ? "Showing $from-$to of $total students" : "No students found" ?>
+                            <?= $total ? "Showing $from-$to of $total assignments" : "No assignments found" ?>
                         </div>
                     </div>
-                    <table class="students-table">
+                    <table class="assignments-table">
                         <thead>
                             <tr>
-                                <th>Full Name</th>
-                                <th>Matric No</th>
-                                <th>Email</th>
-                                <th>Faculty</th>
+                                <th>Lecturer</th>
+                                <th>Course</th>
                                 <th>Department</th>
                                 <th>Level</th>
-                                <th>Enrolled</th>
+                                <th>Session</th>
+                                <th>Created</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody>
-                            <?php if (empty($students)): ?>
+                            <?php if (empty($assignments)): ?>
                                 <tr>
-                                    <td colspan="8" class="small" style="color:#718096; padding: 1rem;">No students match your criteria.</td>
+                                    <td colspan="7" class="small" style="color:#718096; padding: 1rem;">No assignments match your criteria.</td>
                                 </tr>
                             <?php else: ?>
-                                <?php foreach ($students as $s): ?>
+                                <?php foreach ($assignments as $a): ?>
                                     <tr>
-                                        <td><?= h($s['full_name']) ?></td>
-                                        <td><strong><?= h($s['matric_no']) ?></strong></td>
-                                        <td><?= h($s['email']) ?></td>
-                                        <td><?= h($s['faculty_name']) ?></td>
-                                        <td><?= h($s['dept_name']) ?></td>
-                                        <td><?= h($s['level_name'] ?: (string)$s['level']) ?></td>
-                                        <td><?= h($s['created_at']) ?></td>
+                                        <td>
+                                            <strong><?= h($a['lecturer_name']) ?></strong><br>
+                                            <small style="color:#718096;"><?= h($a['staff_no']) ?></small>
+                                        </td>
+                                        <td>
+                                            <strong><?= h($a['course_code']) ?></strong><br>
+                                            <small style="color:#718096;"><?= h($a['course_name']) ?></small>
+                                        </td>
+                                        <td><?= h($a['dept_name']) ?></td>
+                                        <td><?= h($a['level_name']) ?></td>
+                                        <td><?= h($a['session']) ?></td>
+                                        <td><?= h($a['created_at']) ?></td>
                                         <td>
                                             <div class="action-buttons-table">
-                                                <button type="button" class="btn-sm js-edit-student"
+                                                <button type="button" class="btn-sm js-edit-assignment"
                                                     title="Edit"
-                                                    data-student='<?= h(json_encode([
-                                                                        'student_id' => (string)$s['student_id'],
-                                                                        'matric_no'  => (string)$s['matric_no'],
-                                                                        'full_name'  => (string)$s['full_name'],
-                                                                        'email'      => (string)$s['email'],
-                                                                        'faculty_id' => (string)$s['faculty_id'],
-                                                                        'dept_id'    => (string)$s['dept_id'],
-                                                                        'level'      => (string)$s['level'],
-                                                                        'enrolled'   => substr((string)$s['created_at'], 0, 10),
-                                                                    ], JSON_UNESCAPED_UNICODE)) ?>'>
+                                                    data-assignment='<?= h(json_encode([
+                                                                            'assignment_id' => (string)$a['assignment_id'],
+                                                                            'lecturer_id'   => (string)$a['lecturer_id'],
+                                                                            'course_id'     => (string)$a['course_id'],
+                                                                            'dept_id'       => (string)$a['dept_id'],
+                                                                            'level_id'      => (string)$a['level_id'],
+                                                                            'session'       => (string)$a['session'],
+                                                                        ], JSON_UNESCAPED_UNICODE)) ?>'>
                                                     <i class="fas fa-edit"></i>
                                                 </button>
-                                                <form method="post" style="display:inline" onsubmit="return confirm('Delete student <?= h($s['matric_no']) ?>?');">
+                                                <form method="post" style="display:inline" onsubmit="return confirm('Delete this assignment?');">
                                                     <input type="hidden" name="csrf" value="<?= h($_SESSION['csrf'] ?? '') ?>">
                                                     <input type="hidden" name="op" value="delete">
-                                                    <input type="hidden" name="student_id" value="<?= h((string)$s['student_id']) ?>">
+                                                    <input type="hidden" name="assignment_id" value="<?= h((string)$a['assignment_id']) ?>">
                                                     <button type="submit" class="btn-sm" title="Delete"><i class="fas fa-trash"></i></button>
                                                 </form>
                                             </div>
@@ -1140,7 +1283,6 @@ function build_query(array $params): string
                         <div class="pagination-info"><?= $total ? "Showing $from to $to of $total entries" : "0 entries" ?></div>
                         <div class="pagination">
                             <?php
-                            // Simple pagination buttons: Prev, numbered window, Next
                             $window = 3;
                             $start = max(1, $page - $window);
                             $end   = min($totalPages, $page + $window);
@@ -1160,12 +1302,12 @@ function build_query(array $params): string
     </div>
     <!-- [ Main Content ] end -->
 
-    <!-- Add/Edit Student Modal -->
-    <div id="studentModal" class="modal" aria-hidden="true">
+    <!-- Add/Edit Assignment Modal -->
+    <div id="assignmentModal" class="modal" aria-hidden="true">
         <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
             <div class="modal-header">
-                <h2 class="modal-title" id="modalTitle"><?= $modalMode === 'update' ? 'Edit Student' : 'Add New Student' ?></h2>
-                <button class="close-btn" id="studentClose" aria-label="Close">&times;</button>
+                <h2 class="modal-title" id="modalTitle"><?= $modalMode === 'update' ? 'Edit Assignment' : 'Assign Course' ?></h2>
+                <button class="close-btn" id="assignmentClose" aria-label="Close">&times;</button>
             </div>
             <?php if (!empty($formErrors)): ?>
                 <div class="alert alert-error" style="background: rgba(245,101,101,.12); color:#c53030; border: 1px solid rgba(245,101,101,.25); padding: .8rem 1rem; border-radius: 10px; margin-bottom: 12px;">
@@ -1175,58 +1317,66 @@ function build_query(array $params): string
                     endforeach; ?>
                 </div>
             <?php endif; ?>
-            <form id="studentForm" method="post" action="" novalidate>
+            <form id="assignmentForm" method="post" action="" novalidate>
                 <input type="hidden" name="csrf" value="<?= h($_SESSION['csrf'] ?? '') ?>">
                 <input type="hidden" name="op" id="opField" value="<?= $modalMode === 'update' ? 'update' : 'create' ?>">
-                <input type="hidden" name="student_id" id="editingStudentId" value="<?= h($old['student_id'] ?? '') ?>">
+                <input type="hidden" name="assignment_id" id="editingAssignmentId" value="<?= h($old['assignment_id'] ?? '') ?>">
 
                 <div class="form-group">
-                    <label class="form-label" for="fullName">Full Name</label>
-                    <input type="text" class="form-input" name="full_name" id="fullName" required value="<?= h($old['full_name'] ?? '') ?>">
-                </div>
-                <div class="form-group">
-                    <label class="form-label" for="matricNo">Matric No</label>
-                    <input type="text" class="form-input" name="matric_no" id="matricNo" required value="<?= h($old['matric_no'] ?? '') ?>">
-                </div>
-                <div class="form-group">
-                    <label class="form-label" for="email">Email (optional)</label>
-                    <input type="email" class="form-input" name="email" id="email" placeholder="student@example.com" value="<?= h($old['email'] ?? '') ?>">
-                </div>
-                <div class="form-group">
-                    <label class="form-label" for="facultyId">Faculty</label>
-                    <select class="form-select" name="faculty_id" id="facultyId" required>
-                        <option value="">Select Faculty</option>
-                        <?php foreach ($faculties as $f): ?>
-                            <option value="<?= (int)$f['faculty_id'] ?>" <?= (isset($old['faculty_id']) && (int)$old['faculty_id'] === (int)$f['faculty_id']) ? 'selected' : '' ?>><?= h($f['faculty_name']) ?></option>
+                    <label class="form-label" for="lecturerId">Lecturer</label>
+                    <select class="form-select" name="lecturer_id" id="lecturerId" required>
+                        <option value="">Select Lecturer</option>
+                        <?php foreach ($lecturers as $l): ?>
+                            <option value="<?= (int)$l['lecturer_id'] ?>"
+                                data-faculty="<?= (int)$l['faculty_id'] ?>"
+                                data-dept="<?= (int)$l['dept_id'] ?>"
+                                <?= (isset($old['lecturer_id']) && (int)$old['lecturer_id'] === (int)$l['lecturer_id']) ? 'selected' : '' ?>>
+                                <?= h($l['lecturer_name']) ?> (<?= h($l['staff_no']) ?>) - <?= h($l['dept_name']) ?>
+                            </option>
                         <?php endforeach; ?>
                     </select>
                 </div>
+
                 <div class="form-group">
-                    <label class="form-label" for="deptId">Department</label>
-                    <select class="form-select" name="dept_id" id="deptId" required>
-                        <option value="">Select Department</option>
-                        <?php foreach ($departments as $d): ?>
-                            <option value="<?= (int)$d['dept_id'] ?>" data-faculty="<?= (int)$d['faculty_id'] ?>" <?= (isset($old['dept_id']) && (int)$old['dept_id'] === (int)$d['dept_id']) ? 'selected' : '' ?>><?= h($d['dept_name']) ?></option>
+                    <label class="form-label" for="courseId">Course</label>
+                    <select class="form-select" name="course_id" id="courseId" required>
+                        <option value="">Select Course</option>
+                        <?php foreach ($courses as $c): ?>
+                            <option value="<?= (int)$c['course_id'] ?>"
+                                data-dept="<?= (int)$c['dept_id'] ?>"
+                                data-level="<?= (int)$c['level_id'] ?>"
+                                data-dept-name="<?= h($c['dept_name']) ?>"
+                                data-level-name="<?= h($c['level_name']) ?>"
+                                <?= (isset($old['course_id']) && (int)$old['course_id'] === (int)$c['course_id']) ? 'selected' : '' ?>>
+                                <?= h($c['course_code']) ?> - <?= h($c['course_name']) ?>
+                            </option>
                         <?php endforeach; ?>
                     </select>
                 </div>
+
                 <div class="form-group">
-                    <label class="form-label" for="level">Level</label>
-                    <select class="form-select" name="level" id="level" required>
-                        <option value="">Select Level</option>
-                        <?php foreach ($levels as $lv): ?>
-                            <option value="<?= (int)$lv['level_id'] ?>" <?= (isset($old['level']) && (int)$old['level'] === (int)$lv['level_id']) ? 'selected' : '' ?>><?= h($lv['level_name']) ?></option>
-                        <?php endforeach; ?>
-                    </select>
+                    <label class="form-label" for="deptId">Department <small>(Auto-populated from course)</small></label>
+                    <input type="text" class="form-input" id="deptDisplay" readonly placeholder="Select a course first">
+                    <input type="hidden" name="dept_id" id="deptId" value="<?= h($old['dept_id'] ?? '') ?>">
                 </div>
+
                 <div class="form-group">
-                    <label class="form-label" for="enrolled">Enrolled (Date)</label>
-                    <input type="date" class="form-input" name="enrolled" id="enrolled" value="<?= h($old['enrolled'] ?? '') ?>">
+                    <label class="form-label" for="levelId">Level <small>(Auto-populated from course)</small></label>
+                    <input type="text" class="form-input" id="levelDisplay" readonly placeholder="Select a course first">
+                    <input type="hidden" name="level_id" id="levelId" value="<?= h($old['level_id'] ?? '') ?>">
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label" for="sessionInput">Academic Session</label>
+                    <input type="text" class="form-input" name="session" id="sessionInput"
+                        placeholder="e.g., 2023/2024"
+                        value="<?= h($old['session'] ?? '') ?>" required>
+                    <small style="color: #718096; font-size: 0.8rem;">Enter the academic session (e.g., 2023/2024, 2024/2025)</small>
                 </div>
 
                 <div class="modal-actions">
-                    <button type="button" class="btn btn-muted" id="studentCancel">Cancel</button>
-                    <button type="submit" class="btn btn-primary" id="studentSave">Save Student</button>
+                    <button type="button" class="btn btn-muted" id="assignmentCancel">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="assignmentSave">Save Assignment</button>
                 </div>
             </form>
         </div>
@@ -1240,29 +1390,52 @@ function build_query(array $params): string
 
     <script>
         (function() {
-            const openBtn = document.getElementById('openAddStudent');
-            const modal = document.getElementById('studentModal');
-            const closeBtn = document.getElementById('studentClose');
-            const cancelBtn = document.getElementById('studentCancel');
+            const openBtn = document.getElementById('openAddAssignment');
+            const modal = document.getElementById('assignmentModal');
+            const closeBtn = document.getElementById('assignmentClose');
+            const cancelBtn = document.getElementById('assignmentCancel');
             const titleEl = document.getElementById('modalTitle');
-            const form = document.getElementById('studentForm');
+            const form = document.getElementById('assignmentForm');
             const opField = document.getElementById('opField');
 
             // Inputs
             const input = {
-                id: document.getElementById('editingStudentId'),
-                fullName: document.getElementById('fullName'),
-                matric: document.getElementById('matricNo'),
-                email: document.getElementById('email'),
-                fac: document.getElementById('facultyId'),
+                id: document.getElementById('editingAssignmentId'),
+                lecturer: document.getElementById('lecturerId'),
+                course: document.getElementById('courseId'),
                 dept: document.getElementById('deptId'),
-                level: document.getElementById('level'),
-                enrolled: document.getElementById('enrolled')
+                deptDisplay: document.getElementById('deptDisplay'),
+                level: document.getElementById('levelId'),
+                levelDisplay: document.getElementById('levelDisplay'),
+                session: document.getElementById('sessionInput')
             };
+
+            // Course selection handler
+            input.course.addEventListener('change', function() {
+                const selectedOption = this.options[this.selectedIndex];
+                if (selectedOption.value) {
+                    const deptId = selectedOption.getAttribute('data-dept');
+                    const levelId = selectedOption.getAttribute('data-level');
+                    const deptName = selectedOption.getAttribute('data-dept-name');
+                    const levelName = selectedOption.getAttribute('data-level-name');
+
+                    // Auto-populate department and level
+                    input.dept.value = deptId;
+                    input.deptDisplay.value = deptName;
+                    input.level.value = levelId;
+                    input.levelDisplay.value = levelName;
+                } else {
+                    // Clear fields if no course selected
+                    input.dept.value = '';
+                    input.deptDisplay.value = '';
+                    input.level.value = '';
+                    input.levelDisplay.value = '';
+                }
+            });
 
             function showModal() {
                 modal.classList.add('show');
-                setTimeout(() => input.fullName && input.fullName.focus(), 120);
+                setTimeout(() => input.lecturer && input.lecturer.focus(), 120);
             }
 
             function hideModal() {
@@ -1271,38 +1444,32 @@ function build_query(array $params): string
 
             function setMode(mode, data) {
                 opField.value = mode === 'update' ? 'update' : 'create';
-                titleEl.textContent = mode === 'update' ? 'Edit Student' : 'Add New Student';
+                titleEl.textContent = mode === 'update' ? 'Edit Assignment' : 'Assign Course';
                 if (data) {
-                    input.id.value = data.student_id || '';
-                    input.fullName.value = data.full_name || '';
-                    input.matric.value = data.matric_no || '';
-                    input.email.value = data.email || '';
-                    input.fac.value = data.faculty_id || '';
-                    filterDepartmentsSelect();
+                    input.id.value = data.assignment_id || '';
+                    input.lecturer.value = data.lecturer_id || '';
+                    input.course.value = data.course_id || '';
                     input.dept.value = data.dept_id || '';
-                    input.level.value = data.level || '';
-                    input.enrolled.value = data.enrolled || '';
+                    input.level.value = data.level_id || '';
+                    input.session.value = data.session || '';
+
+                    // Trigger course change to populate display fields
+                    if (data.course_id) {
+                        const courseOption = input.course.querySelector(`option[value="${data.course_id}"]`);
+                        if (courseOption) {
+                            input.deptDisplay.value = courseOption.getAttribute('data-dept-name') || '';
+                            input.levelDisplay.value = courseOption.getAttribute('data-level-name') || '';
+                        }
+                    }
                 } else {
                     form.reset();
                     input.id.value = '';
-                    filterDepartmentsSelect();
+                    input.dept.value = '';
+                    input.deptDisplay.value = '';
+                    input.level.value = '';
+                    input.levelDisplay.value = '';
                 }
             }
-
-            function filterDepartmentsSelect() {
-                const fac = input.fac.value;
-                Array.from(input.dept.options).forEach(opt => {
-                    if (opt.value === '') {
-                        opt.hidden = false;
-                        return;
-                    }
-                    const f = opt.getAttribute('data-faculty');
-                    const show = !fac || f === fac;
-                    opt.hidden = !show;
-                    if (!show && opt.selected) opt.selected = false;
-                });
-            }
-            input.fac.addEventListener('change', filterDepartmentsSelect);
 
             if (openBtn) openBtn.addEventListener('click', () => {
                 setMode('create');
@@ -1318,38 +1485,17 @@ function build_query(array $params): string
             });
 
             // Edit buttons
-            document.querySelectorAll('.js-edit-student').forEach(btn => {
+            document.querySelectorAll('.js-edit-assignment').forEach(btn => {
                 btn.addEventListener('click', () => {
                     try {
-                        const data = JSON.parse(btn.getAttribute('data-student') || '{}');
+                        const data = JSON.parse(btn.getAttribute('data-assignment') || '{}');
                         setMode('update', data);
                         showModal();
                     } catch (e) {
-                        console.error('Bad student data', e);
+                        console.error('Bad assignment data', e);
                     }
                 });
             });
-
-            // Filter departments in the filter bar too
-            const filterFaculty = document.getElementById('filterFaculty');
-            const filterDept = document.getElementById('filterDept');
-
-            function filterDeptBar() {
-                const f = filterFaculty.value;
-                Array.from(filterDept.options).forEach(opt => {
-                    if (opt.value === '') {
-                        opt.hidden = false;
-                        return;
-                    }
-                    const fac = opt.getAttribute('data-faculty');
-                    opt.hidden = (f && fac !== f);
-                    if (opt.hidden && opt.selected) opt.selected = false;
-                });
-            }
-            if (filterFaculty && filterDept) {
-                filterDeptBar();
-                filterFaculty.addEventListener('change', filterDeptBar);
-            }
 
             // Auto-open modal when server-side validation failed
             <?php if (!empty($openModal)): ?>
@@ -1361,3 +1507,4 @@ function build_query(array $params): string
 </body>
 
 </html>
+</qodoArtifact>
