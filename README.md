@@ -1,5 +1,3 @@
-<img width="1366" height="768" alt="Screenshot (410)" src="https://github.com/user-attachments/assets/03961f17-dd09-4354-916e-d6939c7c9abb" />📊 Hybrid Marking & Grading System
-📖 Overview
 
 The Hybrid Marking & Grading System is a web-based application designed to improve fairness, consistency, and efficiency in educational assessments. The system combines automation (for objective tasks like multiple-choice and short-answer questions) with human evaluation (for subjective tasks like essays, projects, and remarks).
 
